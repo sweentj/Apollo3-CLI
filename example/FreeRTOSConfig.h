@@ -24,6 +24,8 @@
 #define configENABLE_BACKWARD_COMPATIBILITY 0
 #define configSUPPORT_DYNAMIC_ALLOCATION 1
 #define configSUPPORT_STATIC_ALLOCATION 0
+/* FreeRTOS+CLI shared response buffer; enough for each command's help text. */
+#define configCOMMAND_INT_MAX_OUTPUT_SIZE 256
 #define configUSE_IDLE_HOOK 0
 #define configUSE_TICK_HOOK 0
 #define configCHECK_FOR_STACK_OVERFLOW 2

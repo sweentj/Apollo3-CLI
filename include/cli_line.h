@@ -30,4 +30,8 @@ void cli_line_invalidate(cli_line_t *line);
 /* READY text remains valid until the next feed; CRLF produces one READY. */
 cli_line_event_t cli_line_feed(cli_line_t *line, uint8_t byte);
 
+/* Trim leading/trailing whitespace and collapse spaces/tabs in place for
+ * FreeRTOS+CLI, which recognizes spaces only. Input must be NUL-terminated. */
+void cli_line_normalize(char *text);
+
 #endif

@@ -1,30 +1,57 @@
 #include "cli_command.h"
+#include "FreeRTOS_CLI.h"
 
-#include <stddef.h>
 #include <string.h>
 
-typedef struct {
-    const char *start;
-    size_t length;
-} token_t;
+static QueueHandle_t request_queue;
 
-static int next_token(const char **cursor, token_t *token)
+static BaseType_t read_command(char *output, size_t capacity, const char *command);
+static BaseType_t write_command(char *output, size_t capacity, const char *command);
+
+static const CLI_Command_Definition_t commands[] = {
+    {
+        "i2c_read",
+        "i2c_read <addr> <reg> <len>:\r\n"
+        " All values: 0xNN. Read length: 0x01..0xFF.\r\n"
+        " OK queued is not I2C completion.\r\n\r\n",
+        read_command,
+        3
+    },
+    {
+        "i2c_write",
+        "i2c_write <addr> <reg> <data1> ... <data16>:\r\n"
+        " All values: 0xNN. Write: 1..16 bytes.\r\n"
+        " Backspace/Delete edit; Ctrl-C cancels input.\r\n"
+        " OK queued is not I2C completion.\r\n\r\n",
+        write_command,
+        -1 /* Variable count: the callback validates the 1..16 byte limit. */
+    }
+};
+
+BaseType_t cli_commands_register(QueueHandle_t requests)
 {
-    while (**cursor == ' ' || **cursor == '\t') {
-        ++*cursor;
+    static size_t registered;
+    if (requests == NULL) return pdFAIL;
+    /* FreeRTOS+CLI has no unregister API. Keep successful registrations if a
+     * later allocation/startup fails, and resume at the next command on retry. */
+    while (registered < sizeof(commands) / sizeof(commands[0])) {
+        if (FreeRTOS_CLIRegisterCommand(&commands[registered]) != pdPASS) return pdFAIL;
+        ++registered;
     }
-    token->start = *cursor;
-    while (**cursor != '\0' && **cursor != ' ' && **cursor != '\t') {
-        ++*cursor;
-    }
-    token->length = (size_t)(*cursor - token->start);
-    return token->length != 0u;
+    request_queue = requests;
+    return pdPASS;
 }
 
-static int matches(token_t token, const char *word)
+static BaseType_t reply(char *output, size_t capacity, const char *text)
 {
-    return token.length == strlen(word) &&
-           memcmp(token.start, word, token.length) == 0;
+    if (capacity != 0u) {
+        size_t length = strlen(text);
+        if (length >= capacity) length = capacity - 1u;
+        memcpy(output, text, length);
+        output[length] = '\0';
+    }
+    /* Each I2C callback completes in one call; never queue it twice. */
+    return pdFALSE;
 }
 
 static int hex_digit(char c)
@@ -35,57 +62,72 @@ static int hex_digit(char c)
     return -1;
 }
 
-static int hex_byte(token_t token, uint8_t *value)
+static BaseType_t parameter_byte(const char *command, UBaseType_t index, uint8_t *value)
 {
+    BaseType_t length;
+    const char *parameter = FreeRTOS_CLIGetParameter(command, index, &length);
     int hi, lo;
-    if (token.length != 4u || token.start[0] != '0' || token.start[1] != 'x') {
-        return 0;
+    /* Framework parameters are spans, not NUL-terminated strings. */
+    if (parameter == NULL || length != 4 || parameter[0] != '0' || parameter[1] != 'x') {
+        return pdFAIL;
     }
-    hi = hex_digit(token.start[2]);
-    lo = hex_digit(token.start[3]);
-    if (hi < 0 || lo < 0) return 0;
+    hi = hex_digit(parameter[2]);
+    lo = hex_digit(parameter[3]);
+    if (hi < 0 || lo < 0) return pdFAIL;
     *value = (uint8_t)((hi << 4) | lo);
-    return 1;
+    return pdPASS;
 }
 
-cli_parse_result_t cli_parse_command(const char *line,
-                                     cli_i2c_request_t *request)
+static BaseType_t queue_request(char *output, size_t capacity, const cli_i2c_request_t *request)
 {
-    token_t command, token;
-    uint8_t args[2u + CLI_I2C_MAX_WRITE_BYTES];
-    size_t count = 0;
-    cli_i2c_request_t parsed = {0};
+    if (request_queue == NULL) return reply(output, capacity, "ERR I2C queue unavailable\r\n");
+    /* Copy all arguments, including write data, without blocking UART input. */
+    if (xQueueSend(request_queue, request, 0) != pdPASS) {
+        return reply(output, capacity, "ERR I2C queue full; command not queued\r\n");
+    }
+    return reply(output, capacity, "OK queued\r\n");
+}
 
-    if (line == NULL || request == NULL) return CLI_PARSE_INVALID_ARGUMENT;
-    if (!next_token(&line, &command)) return CLI_PARSE_EMPTY;
-    if (matches(command, "help")) {
-        return next_token(&line, &token) ? CLI_PARSE_ARGUMENT_COUNT : CLI_PARSE_HELP;
+static BaseType_t read_command(char *output, size_t capacity, const char *command)
+{
+    cli_i2c_request_t request = {0};
+    request.operation = CLI_I2C_READ;
+    /* FreeRTOS+CLI enforces exactly three parameters before calling us. */
+    if (parameter_byte(command, 1, &request.addr) != pdPASS ||
+        parameter_byte(command, 2, &request.reg) != pdPASS ||
+        parameter_byte(command, 3, &request.len) != pdPASS) {
+        return reply(output, capacity, "ERR expected byte in exact 0xNN format\r\n");
     }
-    if (matches(command, "i2c_read")) {
-        parsed.operation = CLI_I2C_READ;
-    } else if (matches(command, "i2c_write")) {
-        parsed.operation = CLI_I2C_WRITE;
-    } else {
-        return CLI_PARSE_UNKNOWN_COMMAND;
+    if (request.len == 0u) {
+        return reply(output, capacity, "ERR read length must be 0x01..0xFF\r\n");
     }
+    return queue_request(output, capacity, &request);
+}
 
-    while (next_token(&line, &token)) {
-        if (count == sizeof(args)) return CLI_PARSE_ARGUMENT_COUNT;
-        if (!hex_byte(token, &args[count])) return CLI_PARSE_INVALID_HEX;
-        ++count;
+static BaseType_t write_command(char *output, size_t capacity, const char *command)
+{
+    cli_i2c_request_t request = {0};
+    BaseType_t length;
+    UBaseType_t count = 0;
+    request.operation = CLI_I2C_WRITE;
+
+    /* Stop as soon as a nineteenth parameter is found (2 address/register +
+     * at most 16 data bytes). Do not truncate or enqueue a partial write. */
+    while (FreeRTOS_CLIGetParameter(command, count + 1u, &length) != NULL) {
+        if (++count > 2u + CLI_I2C_MAX_WRITE_BYTES) {
+            return reply(output, capacity, "ERR argument count; type help\r\n");
+        }
     }
-    if (count < 3u || (parsed.operation == CLI_I2C_READ && count != 3u)) {
-        return CLI_PARSE_ARGUMENT_COUNT;
+    if (count < 3u) return reply(output, capacity, "ERR argument count; type help\r\n");
+    if (parameter_byte(command, 1, &request.addr) != pdPASS ||
+        parameter_byte(command, 2, &request.reg) != pdPASS) {
+        return reply(output, capacity, "ERR expected byte in exact 0xNN format\r\n");
     }
-    parsed.addr = args[0];
-    parsed.reg = args[1];
-    if (parsed.operation == CLI_I2C_READ) {
-        parsed.len = args[2];
-        if (parsed.len == 0u) return CLI_PARSE_ZERO_LENGTH;
-    } else {
-        parsed.len = (uint8_t)(count - 2u);
-        memcpy(parsed.data, &args[2], parsed.len);
+    request.len = (uint8_t)(count - 2u);
+    for (UBaseType_t i = 0; i < request.len; ++i) {
+        if (parameter_byte(command, i + 3u, &request.data[i]) != pdPASS) {
+            return reply(output, capacity, "ERR expected byte in exact 0xNN format\r\n");
+        }
     }
-    *request = parsed;
-    return CLI_PARSE_OK;
+    return queue_request(output, capacity, &request);
 }

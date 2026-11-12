@@ -7,6 +7,24 @@ void cli_line_init(cli_line_t *line)
     memset(line, 0, sizeof(*line));
 }
 
+void cli_line_normalize(char *text)
+{
+    char *read = text;
+    char *write = text;
+    bool space = false;
+    while (*read != '\0') {
+        if (*read == ' ' || *read == '\t') {
+            space = write != text;
+        } else {
+            if (space) *write++ = ' ';
+            *write++ = *read;
+            space = false;
+        }
+        ++read;
+    }
+    *write = '\0';
+}
+
 void cli_line_invalidate(cli_line_t *line)
 {
     line->length = 0;

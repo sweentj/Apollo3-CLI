@@ -21,7 +21,8 @@ typedef enum {
 /* Call once before vTaskStartScheduler(), after board initialization.
  * requests must be created with sizeof(cli_i2c_request_t) and must remain alive.
  * Owns UART0 and am_uart_isr. No other task may access this UART.
- * On failure resources are released and a retry is allowed. */
+ * On failure UART/RX resources are released and a retry is allowed. Framework
+ * command registrations persist for the application lifetime. */
 cli_start_result_t cli_start(QueueHandle_t requests);
 void cli_task(void *argument);
 

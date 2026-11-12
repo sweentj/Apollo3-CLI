@@ -5,6 +5,12 @@
 #include "am_bsp.h"
 #include "cli_task.h"
 #include "cli_line.h"
+#include "FreeRTOS_CLI.h"
+
+/* Must fit each registered help string and framework diagnostic plus NUL. */
+#if configCOMMAND_INT_MAX_OUTPUT_SIZE < 256
+#error "The I2C CLI requires configCOMMAND_INT_MAX_OUTPUT_SIZE >= 256"
+#endif
 
 #define CLI_RX_QUEUE_LENGTH 256u
 #define CLI_UART_ERRORS (AM_HAL_UART_INT_OVER_RUN | AM_HAL_UART_INT_BREAK_ERR | \
@@ -13,7 +19,6 @@
 
 static void *uart;
 static QueueHandle_t rx_queue;
-static QueueHandle_t request_queue;
 static volatile bool rx_lost;
 volatile uint32_t cli_last_hal_error;
 
@@ -66,6 +71,7 @@ cli_start_result_t cli_start(QueueHandle_t requests)
 {
     if (requests == NULL) return CLI_START_INVALID_QUEUE;
     if (rx_queue != NULL) return CLI_START_ALREADY_STARTED;
+    if (cli_commands_register(requests) != pdPASS) return CLI_START_NO_MEMORY;
     rx_queue = xQueueCreate(CLI_RX_QUEUE_LENGTH, sizeof(uint8_t));
     if (rx_queue == NULL) return CLI_START_NO_MEMORY;
     rx_lost = false;
@@ -76,13 +82,11 @@ cli_start_result_t cli_start(QueueHandle_t requests)
         rx_queue = NULL;
         return CLI_START_UART_ERROR;
     }
-    request_queue = requests;
     if (xTaskCreate(cli_task, "cli_task", CLI_TASK_STACK_WORDS, NULL,
                     CLI_TASK_PRIORITY, NULL) != pdPASS) {
         uart_close();
         vQueueDelete(rx_queue);
         rx_queue = NULL;
-        request_queue = NULL;
         return CLI_START_NO_MEMORY;
     }
     return CLI_START_OK;
@@ -142,42 +146,18 @@ static void put_text(const char *text)
     }
 }
 
-static void dispatch(const char *line)
+static void dispatch(char *line)
 {
-    cli_i2c_request_t request;
-    switch (cli_parse_command(line, &request)) {
-    case CLI_PARSE_OK:
-        /* Never stall UART processing while waiting for the I2C worker. */
-        if (xQueueSend(request_queue, &request, 0) == pdPASS) {
-            put_text("OK queued\r\n");
-        } else {
-            put_text("ERR I2C queue full; command not queued\r\n");
-        }
-        break;
-    case CLI_PARSE_EMPTY:
-        break;
-    case CLI_PARSE_HELP:
-        put_text("i2c_read <addr> <reg> <len>\r\n"
-                 "i2c_write <addr> <reg> <data1> ... <data16>\r\n"
-                 "All values: 0xNN. Read length: 0x01..0xFF. Write: 1..16 bytes.\r\n"
-                 "Backspace/Delete edit; Ctrl-C cancels. OK queued is not I2C completion.\r\n");
-        break;
-    case CLI_PARSE_UNKNOWN_COMMAND:
-        put_text("ERR unknown command; type help\r\n");
-        break;
-    case CLI_PARSE_ARGUMENT_COUNT:
-        put_text("ERR argument count; type help\r\n");
-        break;
-    case CLI_PARSE_INVALID_HEX:
-        put_text("ERR expected byte in exact 0xNN format\r\n");
-        break;
-    case CLI_PARSE_ZERO_LENGTH:
-        put_text("ERR read length must be 0x01..0xFF\r\n");
-        break;
-    default:
-        put_text("ERR invalid command\r\n");
-        break;
-    }
+    BaseType_t more;
+    char *output = FreeRTOS_CLIGetOutputBuffer();
+    cli_line_normalize(line);
+    if (line[0] == '\0') return;
+    /* FreeRTOS+CLI owns command lookup, parameter counting and built-in help.
+     * Drain every output chunk before processing another line (non-reentrant). */
+    do {
+        more = FreeRTOS_CLIProcessCommand(line, output, configCOMMAND_INT_MAX_OUTPUT_SIZE);
+        put_text(output);
+    } while (more != pdFALSE);
 }
 
 void cli_task(void *argument)
